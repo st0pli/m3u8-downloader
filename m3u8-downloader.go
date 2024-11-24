@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"crypto/aes"
 	"crypto/cipher"
+	"errors"
 	"flag"
 	"fmt"
 	"io/ioutil"
@@ -17,12 +18,13 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
-
+	
 	"github.com/levigross/grequests"
 )
 
@@ -45,7 +47,11 @@ var (
 	rFlag   = flag.Bool("r", true, "autoClear:是否自动清除ts文件")
 	sFlag   = flag.Int("s", 0, "InsecureSkipVerify:是否允许不安全的请求(默认0)")
 	spFlag  = flag.String("sp", "", "savePath:文件保存的绝对路径(默认为当前路径,建议默认值)")
-
+	// 添加正则过滤ts广告表达式
+	rfFlag = flag.String("rf", "", "正则过滤ts广告表达式")
+	// 添加是否使用ffmpeg
+	ffFlag = flag.Bool("ff", true, "是否启用ffmpeg模式")
+	
 	logger *log.Logger
 	ro     = &grequests.RequestOptions{
 		UserAgent:      "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_13_6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/79.0.3945.88 Safari/537.36",
@@ -57,6 +63,7 @@ var (
 			"Accept-Language": "zh-CN,zh;q=0.9, en;q=0.8, de;q=0.7, *;q=0.5",
 		},
 	}
+	regFilter *regexp.Regexp
 )
 
 // TsInfo 用于保存 ts 文件的下载地址和文件名
@@ -74,22 +81,32 @@ func main() {
 }
 
 func Run() {
-	msgTpl := "[功能]:多线程下载直播流m3u8视屏\n[提醒]:下载失败，请使用 -ht=v2 \n[提醒]:下载失败，m3u8 地址可能存在嵌套\n[提醒]:进度条中途下载失败，可重复执行"
+	msgTpl := "[功能]:多线程下载直播流m3u8视屏\n[提醒]:下载失败，请使用 -ht=v2 \n[提醒]:下载失败，m3u8 地址可能存在嵌套\n[提醒]:进度条中途下载失败，可重复执行\n[提醒]:如果使用ffmpeg模式报错[too many open files] 请根据系统情况临时提高文件描述符的限制，如：ulimit -n 2048"
 	fmt.Println(msgTpl)
 	runtime.GOMAXPROCS(runtime.NumCPU())
 	now := time.Now()
-
+	
 	// 1、解析命令行参数
 	flag.Parse()
 	m3u8Url := *urlFlag
 	maxGoroutines := *nFlag
 	hostType := *htFlag
 	movieName := *oFlag
+	// 过滤带mp4后缀
+	if name := strings.ToLower(movieName); strings.HasSuffix(name, ".mp4") {
+		movieName = movieName[:len(movieName)-4]
+	}
 	autoClearFlag := *rFlag
 	cookie := *cFlag
 	insecure := *sFlag
 	savePath := *spFlag
-
+	// 添加正则过滤ts广告表达式
+	if *rfFlag != "" {
+		regFilter = regexp.MustCompile(*rfFlag)
+	}
+	// 添加是否使用ffmpeg
+	isFfmpeg := *ffFlag
+	
 	ro.Headers["Referer"] = getHost(m3u8Url, "v2")
 	if insecure != 0 {
 		ro.InsecureSkipVerify = true
@@ -112,7 +129,7 @@ func Run() {
 	if isExist, _ := pathExists(download_dir); !isExist {
 		os.MkdirAll(download_dir, os.ModePerm)
 	}
-
+	
 	// 2、解析m3u8
 	m3u8Host := getHost(m3u8Url, hostType)
 	m3u8Body := getM3u8Body(m3u8Url)
@@ -123,21 +140,22 @@ func Run() {
 	}
 	ts_list := getTsList(m3u8Host, m3u8Body)
 	fmt.Println("待下载 ts 文件数量:", len(ts_list))
-
+	
 	// 3、下载ts文件到download_dir
 	downloader(ts_list, maxGoroutines, download_dir, ts_key)
 	if ok := checkTsDownDir(download_dir); !ok {
 		fmt.Printf("\n[Failed] 请检查url地址有效性 \n")
 		return
 	}
-
+	
 	// 4、合并ts切割文件成mp4文件
-	mv := mergeTs(download_dir)
+	mv, err := mergeTs(download_dir, len(ts_list), isFfmpeg)
+	checkErr(err)
 	if autoClearFlag {
 		//自动清除ts文件目录
 		os.RemoveAll(download_dir)
 	}
-
+	
 	//5、输出下载视频信息
 	DrawProgressBar("Merging", float32(1), PROGRESS_WIDTH, mv)
 	fmt.Printf("\n[Success] 下载保存路径：%s | 共耗时: %6.2fs\n", mv, time.Now().Sub(now).Seconds())
@@ -191,6 +209,10 @@ func getTsList(host, body string) (tsList []TsInfo) {
 	var ts TsInfo
 	for _, line := range lines {
 		if !strings.HasPrefix(line, "#") && line != "" {
+			// 添加正则过滤ts广告表达式
+			if regFilter != nil && regFilter.MatchString(line) {
+				continue
+			}
 			//有可能出现的二级嵌套格式的m3u8,请自行转换！
 			index++
 			if strings.HasPrefix(line, "http") {
@@ -210,11 +232,6 @@ func getTsList(host, body string) (tsList []TsInfo) {
 		}
 	}
 	return
-}
-
-func getFromFile() string {
-	data, _ := ioutil.ReadFile("./ts.txt")
-	return string(data)
 }
 
 // 下载ts文件
@@ -309,11 +326,9 @@ func checkTsDownDir(dir string) bool {
 }
 
 // 合并ts文件
-func mergeTs(downloadDir string) string {
+func mergeTs(downloadDir string, tsTotal int, isFfmpeg bool) (string, error) {
+	tsPathList := make([]string, 0, tsTotal)
 	mvName := downloadDir + ".mp4"
-	outMv, _ := os.Create(mvName)
-	defer outMv.Close()
-	writer := bufio.NewWriter(outMv)
 	err := filepath.Walk(downloadDir, func(path string, f os.FileInfo, err error) error {
 		if f == nil {
 			return err
@@ -321,13 +336,43 @@ func mergeTs(downloadDir string) string {
 		if f.IsDir() || filepath.Ext(path) != ".ts" {
 			return nil
 		}
-		bytes, _ := ioutil.ReadFile(path)
-		_, err = writer.Write(bytes)
-		return err
+		tsPathList = append(tsPathList, path)
+		return nil
 	})
-	checkErr(err)
-	_ = writer.Flush()
-	return mvName
+	if err != nil {
+		return "", err
+	}
+	if len(tsPathList) != tsTotal {
+		return "", errors.New("本地ts文件数量错误")
+	}
+	if isFfmpeg {
+		cmd := exec.Command("ffmpeg", "-i", fmt.Sprintf("concat:%s", strings.Join(tsPathList, "|")), "-c", "copy", "-bsf:a", "aac_adtstoasc", mvName)
+		cmd.Stdout = os.Stdout
+		cmd.Stdin = os.Stdin
+		cmd.Stderr = os.Stderr
+		if err := cmd.Run(); err != nil {
+			return "", err
+		}
+		
+	} else {
+		outMv, _ := os.Create(mvName)
+		defer outMv.Close()
+		writer := bufio.NewWriter(outMv)
+		for _, tsPath := range tsPathList {
+			bytes, err := ioutil.ReadFile(tsPath)
+			if err != nil {
+				return "", err
+			}
+			_, err = writer.Write(bytes)
+			if err != nil {
+				return "", err
+			}
+		}
+		err = writer.Flush()
+		return "", err
+	}
+	
+	return mvName, nil
 }
 
 // 进度条
@@ -375,28 +420,6 @@ func execWinShell(s string) error {
 	return nil
 }
 
-// windows 合并文件
-func win_merge_file(path string) {
-	pwd, _ := os.Getwd()
-	os.Chdir(path)
-	execWinShell("copy /b *.ts merge.tmp")
-	execWinShell("del /Q *.ts")
-	os.Rename("merge.tmp", "merge.mp4")
-	os.Chdir(pwd)
-}
-
-// unix 合并文件
-func unix_merge_file(path string) {
-	pwd, _ := os.Getwd()
-	os.Chdir(path)
-	//cmd := `ls  *.ts |sort -t "\." -k 1 -n |awk '{print $0}' |xargs -n 1 -I {} bash -c "cat {} >> new.tmp"`
-	cmd := `cat *.ts >> merge.tmp`
-	execUnixShell(cmd)
-	execUnixShell("rm -rf *.ts")
-	os.Rename("merge.tmp", "merge.mp4")
-	os.Chdir(pwd)
-}
-
 // ============================== 加解密相关 ==============================
 
 func PKCS7Padding(ciphertext []byte, blockSize int) []byte {
@@ -409,25 +432,6 @@ func PKCS7UnPadding(origData []byte) []byte {
 	length := len(origData)
 	unpadding := int(origData[length-1])
 	return origData[:(length - unpadding)]
-}
-
-func AesEncrypt(origData, key []byte, ivs ...[]byte) ([]byte, error) {
-	block, err := aes.NewCipher(key)
-	if err != nil {
-		return nil, err
-	}
-	blockSize := block.BlockSize()
-	var iv []byte
-	if len(ivs) == 0 {
-		iv = key
-	} else {
-		iv = ivs[0]
-	}
-	origData = PKCS7Padding(origData, blockSize)
-	blockMode := cipher.NewCBCEncrypter(block, iv[:blockSize])
-	crypted := make([]byte, len(origData))
-	blockMode.CryptBlocks(crypted, origData)
-	return crypted, nil
 }
 
 func AesDecrypt(crypted, key []byte, ivs ...[]byte) ([]byte, error) {
